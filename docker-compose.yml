@@ -1,0 +1,64 @@
+services:
+  queue-broker:
+    image: rabbitmq:3-management
+    container_name: queue-broker
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2048M  # Optimizado para evitar OOM 137
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api-gateway:
+    build: ./api_gateway
+    container_name: api-gateway
+    ports:
+      - "8000:8000"
+    depends_on:
+      queue-broker:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1024M  # Optimizado
+    environment:
+      - RABBITMQ_HOST=queue-broker
+
+  matching-engine:
+    build: ./matching_engine
+    container_name: matching-engine
+    depends_on:
+      queue-broker:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.5'
+          memory: 3078M  # Optimizado
+    environment:
+      - RABBITMQ_HOST=queue-broker
+      - PREFETCH_COUNT=100
+
+  injector:
+    build: ./injector
+    container_name: injector
+    ports:
+      - "8089:8089"
+    depends_on:
+      api-gateway:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1024M  # Optimizado
+    environment:
+      - TARGET_URL=http://api-gateway:8000
