@@ -1,80 +1,45 @@
-"""
-Confirmation Dispatcher
-- Consume el canal transaccional prioritario (trade_confirmations) por una
-  conexión pika DEDICADA (aislada del tráfico de mercado/orders_buffer).
-- Deduplica con IdempotencyGuard (L1 cachetools + L2 Redis).
-- Entrega la confirmación a comprador y vendedor por un canal push
-  persistente (WebSocket), evitando el retardo estructural del polling.
-- Reconecta automáticamente si la conexión con RabbitMQ se cae: antes, si
-  esto pasaba, el hilo consumidor moría en silencio (era un daemon thread)
-  y /health seguía devolviendo "ok" aunque ya no se procesara nada más.
-"""
-import asyncio
-import json
-import logging
-import os
-import threading
-import time
+import asyncio, json, logging, os, threading, time
 from collections import defaultdict
-
 import pika
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
 from idempotency import IdempotencyGuard
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dispatcher")
 
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+CONFIRMATION_EXCHANGE = os.getenv("CONFIRMATION_EXCHANGE", "trade_events")
 CONFIRMATION_QUEUE = os.getenv("CONFIRMATION_QUEUE", "trade_confirmations")
+CONFIRMATION_ROUTING_KEY = os.getenv("CONFIRMATION_ROUTING_KEY", "trade.confirmation")
 
-CONNECTION_PARAMS = dict(
-    heartbeat=60,
-    blocked_connection_timeout=30,
-    connection_attempts=10,
-    retry_delay=2,
-)
+PARAMS = dict(heartbeat=60, blocked_connection_timeout=30,
+              connection_attempts=10, retry_delay=2)
+RECOVERABLE = (pika.exceptions.AMQPConnectionError,
+               pika.exceptions.ConnectionClosedByBroker,
+               pika.exceptions.ChannelClosedByBroker,
+               pika.exceptions.ChannelWrongStateError,
+               pika.exceptions.StreamLostError, ConnectionError, OSError)
 
-RECOVERABLE_ERRORS = (
-    pika.exceptions.AMQPConnectionError,
-    pika.exceptions.ConnectionClosedByBroker,
-    pika.exceptions.ChannelClosedByBroker,
-    pika.exceptions.ChannelWrongStateError,
-    pika.exceptions.StreamLostError,
-    ConnectionError,
-    OSError,
-)
-
-app = FastAPI()
-idempotency_guard = IdempotencyGuard()
-
-# trader_id -> set de conexiones activas (un trader podría tener >1 pestaña/sesión)
-connections: dict[str, set[WebSocket]] = defaultdict(set)
+app = FastAPI(title="Confirmation Dispatcher", version="2.0")
+guard = IdempotencyGuard()
+connections = defaultdict(set)
 connections_lock = asyncio.Lock()
-
-main_event_loop: asyncio.AbstractEventLoop | None = None
-
-# Se actualiza en cada reconexión exitosa; expuesto en /health para que sea
-# visible desde afuera si el consumidor sigue vivo o lleva rato caído.
+main_event_loop = None
 consumer_status = {"connected": False, "last_error": None}
-
+delivery_metrics = {"received": 0, "dispatched": 0, "duplicates": 0, "failed": 0}
 
 @app.on_event("startup")
 async def startup():
     global main_event_loop
     main_event_loop = asyncio.get_running_loop()
-    # El consumidor pika es bloqueante -> corre en un hilo dedicado, nunca
-    # en el event loop de FastAPI.
-    thread = threading.Thread(target=run_consumer_forever, daemon=True)
-    thread.start()
-
+    threading.Thread(target=run_consumer_forever, daemon=True).start()
 
 @app.websocket("/ws/{trader_id}")
 async def websocket_endpoint(websocket: WebSocket, trader_id: str):
     await websocket.accept()
     async with connections_lock:
         connections[trader_id].add(websocket)
-    logger.info("Trader %s conectado (%d conexiones activas)", trader_id, len(connections[trader_id]))
+    logger.info("[WS] trader=%s connected", trader_id)
     try:
         while True:
             await websocket.receive_text()
@@ -86,118 +51,88 @@ async def websocket_endpoint(websocket: WebSocket, trader_id: str):
             if not connections[trader_id]:
                 del connections[trader_id]
 
-
-async def _send_to_trader(trader_id: str, message: dict):
+async def _send(trader_id, message):
     async with connections_lock:
         sockets = list(connections.get(trader_id, ()))
     if not sockets:
-        logger.warning("Trader %s sin conexión activa; confirmación %s no entregada por push.",
-                        trader_id, message.get("confirmation_id"))
+        logger.warning("[WS] trader=%s sin conexión; confirmation=%s",
+                       trader_id, message["confirmation_id"])
         return
-    payload = json.dumps(message)
+    payload = json.dumps(message, separators=(",", ":"))
     for ws in sockets:
         try:
             await ws.send_text(payload)
         except Exception as exc:
-            logger.warning("Fallo enviando a trader %s: %s", trader_id, exc)
+            logger.warning("[WS] send error trader=%s: %s", trader_id, exc)
 
-
-def dispatch_confirmation(order_data: dict):
+def dispatch_confirmation(data):
     ts_dispatch = time.time_ns()
-    latency_ms = (ts_dispatch - order_data["ts_match_end"]) / 1_000_000.0
-
+    latency_ms = (ts_dispatch - int(data["ts_match_end"])) / 1_000_000
     base = {
-        "confirmation_id": order_data["confirmation_id"],
-        "symbol": order_data["symbol"],
-        "quantity": order_data["quantity"],
-        "ts_match_end": order_data["ts_match_end"],
-        "ts_dispatch": ts_dispatch,
-        "dispatch_latency_ms": round(latency_ms, 3),
+        "confirmation_id": data["confirmation_id"], "symbol": data["symbol"],
+        "quantity": data["quantity"], "ts_match_end": data["ts_match_end"],
+        "ts_dispatch": ts_dispatch, "dispatch_latency_ms": round(latency_ms, 3)
     }
-
-    buy_msg = {**base, "role": "BUY", "order_id": order_data["buy_order_id"]}
-    sell_msg = {**base, "role": "SELL", "order_id": order_data["sell_order_id"]}
-
-    for trader_id, msg in (
-        (order_data["buy_trader_id"], buy_msg),
-        (order_data["sell_trader_id"], sell_msg),
+    for trader_id, role, order_id in (
+        (data["buy_trader_id"], "BUY", data["buy_order_id"]),
+        (data["sell_trader_id"], "SELL", data["sell_order_id"]),
     ):
-        asyncio.run_coroutine_threadsafe(_send_to_trader(trader_id, msg), main_event_loop)
-
-    logger.info("[DISPATCH] %s | latencia dispatcher: %.2fms",
-                order_data["confirmation_id"], latency_ms)
-
+        msg = {**base, "role": role, "order_id": order_id}
+        asyncio.run_coroutine_threadsafe(_send(trader_id, msg), main_event_loop)
+    delivery_metrics["dispatched"] += 1
+    logger.info("[DISPATCH] confirmation=%s latency=%.3fms",
+                data["confirmation_id"], latency_ms)
 
 def on_confirmation_received(ch, method, properties, body):
     try:
-        order_data = json.loads(body)
-        confirmation_id = order_data["confirmation_id"]
-
-        if idempotency_guard.is_first_delivery(confirmation_id):
-            dispatch_confirmation(order_data)
+        data = json.loads(body)
+        delivery_metrics["received"] += 1
+        if guard.is_first_delivery(data["confirmation_id"]):
+            dispatch_confirmation(data)
         else:
-            logger.info("[IDEMPOTENCY] Confirmación duplicada descartada: %s", confirmation_id)
-
+            delivery_metrics["duplicates"] += 1
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception:
-        logger.exception("Error procesando confirmación; se hace nack sin requeue para evitar loop infinito")
+        delivery_metrics["failed"] += 1
+        logger.exception("[DISPATCH][ERROR] nack without requeue")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-
-def _connect_and_declare():
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host=RABBITMQ_HOST, **CONNECTION_PARAMS)
-    )
-    channel = connection.channel()
-    channel.queue_declare(
-        queue=CONFIRMATION_QUEUE,
-        durable=True,
-        arguments={"x-max-priority": 10},
-    )
-    channel.basic_qos(prefetch_count=20)
-    channel.basic_consume(queue=CONFIRMATION_QUEUE, on_message_callback=on_confirmation_received)
-    return connection, channel
-
+def _connect():
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, **PARAMS))
+    ch = conn.channel()
+    ch.exchange_declare(exchange=CONFIRMATION_EXCHANGE, exchange_type="topic", durable=True)
+    ch.queue_declare(queue=CONFIRMATION_QUEUE, durable=True,
+                     arguments={"x-max-priority": 10})
+    ch.queue_bind(exchange=CONFIRMATION_EXCHANGE, queue=CONFIRMATION_QUEUE,
+                 routing_key=CONFIRMATION_ROUTING_KEY)
+    ch.basic_qos(prefetch_count=100)
+    ch.basic_consume(queue=CONFIRMATION_QUEUE, on_message_callback=on_confirmation_received)
+    return conn, ch
 
 def run_consumer_forever():
-    """
-    Bucle exterior de reconexión, igual que en matching_engine. Si la
-    conexión muere, se reconecta y retoma el consumo en vez de dejar el
-    hilo daemon morir en silencio.
-    """
-    backoff_seconds = 1
+    backoff = 1
     while True:
         try:
-            connection, channel = _connect_and_declare()
-            logger.info("[*] Confirmation Dispatcher conectado a '%s' (conexión dedicada).",
-                        CONFIRMATION_QUEUE)
+            conn, ch = _connect()
             consumer_status["connected"] = True
             consumer_status["last_error"] = None
-            backoff_seconds = 1
-            channel.start_consuming()
-        except RECOVERABLE_ERRORS as exc:
+            logger.info("[DISPATCH] conectado exchange=%s queue=%s",
+                        CONFIRMATION_EXCHANGE, CONFIRMATION_QUEUE)
+            backoff = 1
+            ch.start_consuming()
+        except RECOVERABLE as exc:
             consumer_status["connected"] = False
             consumer_status["last_error"] = str(exc)
-            logger.warning("[RECONNECT] Conexión de confirmaciones perdida (%s); "
-                            "reintentando en %ss...", exc, backoff_seconds)
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 30)
+            time.sleep(backoff); backoff = min(backoff * 2, 30)
         except Exception as exc:
-            # Cualquier otro error inesperado tampoco debe matar el hilo
-            # en silencio: se loggea, se marca el estado y se reintenta.
             consumer_status["connected"] = False
             consumer_status["last_error"] = str(exc)
-            logger.exception("[RECONNECT] Error inesperado en el consumidor; reintentando en %ss...",
-                              backoff_seconds)
-            time.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 30)
-
+            logger.exception("[DISPATCH] error inesperado")
+            time.sleep(backoff); backoff = min(backoff * 2, 30)
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok" if consumer_status["connected"] else "degraded",
-        "consumer_connected": consumer_status["connected"],
-        "consumer_last_error": consumer_status["last_error"],
-        "active_traders_connected": len(connections),
-    }
+    return {"status": "ok" if consumer_status["connected"] else "degraded",
+            "consumer_connected": consumer_status["connected"],
+            "consumer_last_error": consumer_status["last_error"],
+            "metrics": delivery_metrics}

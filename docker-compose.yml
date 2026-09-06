@@ -1,23 +1,16 @@
 services:
-  # Nodo 2: Queue Broker (Buffer Asíncrono - RabbitMQ)
   queue-broker:
     image: rabbitmq:3-management
     container_name: queue-broker
     ports:
       - "5672:5672"
       - "15672:15672"
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4096M
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_running"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
 
-  # Ingesta: API Gateway (Simulador HTTP Ligero) - CQRS Command Flow
   api-gateway:
     build: ./api_gateway
     container_name: api-gateway
@@ -26,57 +19,36 @@ services:
     depends_on:
       queue-broker:
         condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2048M
     environment:
-      - RABBITMQ_HOST=queue-broker
+      RABBITMQ_HOST: queue-broker
+      ORDER_QUEUE: orders_buffer
+      ORDER_QUEUE_MAX_LENGTH: "500000"
 
-  # Nodo 3: Matching Engine (Actor Model & In-Memory Processing)
   matching-engine:
     build: ./matching_engine
     container_name: matching-engine
     depends_on:
       queue-broker:
         condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'
-          memory: 8192M
     environment:
-      - RABBITMQ_HOST=queue-broker
-      - PREFETCH_COUNT=100
-      - CONFIRMATION_QUEUE=trade_confirmations
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      RABBITMQ_HOST: queue-broker
+      ORDER_QUEUE: orders_buffer
+      PREFETCH_COUNT: "200"
+      CONFIRMATION_EXCHANGE: trade_events
+      CONFIRMATION_QUEUE: trade_confirmations
+      CONFIRMATION_ROUTING_KEY: trade.confirmation
+      CONFIRMATION_BUFFER_SIZE: "100000"
 
-  # Nodo 4b (NUEVO): Redis - Store L2 de idempotencia (atómico, compartible
-  # entre réplicas del dispatcher). Sin persistencia a disco: es una cache,
-  # no un sistema de registro, así que no debe sumar I/O a la ruta crítica.
   redis-idempotency:
     image: redis:7-alpine
     container_name: redis-idempotency
     command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
-    ports:
-      - "6379:6379"
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 768M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
 
-  # Nodo 4 (NUEVO): Confirmation Dispatcher (Canal transaccional prioritario +
-  # Motor de Idempotencia L1 cachetools / L2 Redis + Push WebSocket)
   confirmation-dispatcher:
     build: ./confirmation_dispatcher
     container_name: confirmation-dispatcher
@@ -87,26 +59,28 @@ services:
         condition: service_healthy
       redis-idempotency:
         condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1024M
     environment:
-      - RABBITMQ_HOST=queue-broker
-      - CONFIRMATION_QUEUE=trade_confirmations
-      - REDIS_HOST=redis-idempotency
-      - REDIS_PORT=6379
-      - IDEMPOTENCY_TTL_SECONDS=300
-      - L1_CACHE_SIZE=50000
-      - L1_CACHE_TTL_SECONDS=120
+      RABBITMQ_HOST: queue-broker
+      CONFIRMATION_EXCHANGE: trade_events
+      CONFIRMATION_QUEUE: trade_confirmations
+      CONFIRMATION_ROUTING_KEY: trade.confirmation
+      REDIS_HOST: redis-idempotency
+      REDIS_PORT: "6379"
+      IDEMPOTENCY_TTL_SECONDS: "300"
+      L1_CACHE_SIZE: "50000"
+      L1_CACHE_TTL_SECONDS: "120"
 
-  # Nodo 5 (NUEVO): Latency Probe - mide el p95 end-to-end del canal
-  # transaccional DESDE DENTRO de la red de docker-compose (sin el salto
-  # de NAT del puerto publicado 8090:8090), para una medición más fiel.
-  # Bajo profile "test": no arranca con `docker compose up`, solo con
-  # `docker compose --profile test run --rm latency-probe`, justo cuando
-  # inicies el tráfico de Locust en la interfaz web.
+  injector:
+    build: ./injector
+    container_name: injector
+    ports:
+      - "8089:8089"
+    depends_on:
+      api-gateway:
+        condition: service_started
+    environment:
+      TARGET_URL: http://api-gateway:8000
+
   latency-probe:
     build: ./latency_probe
     container_name: latency-probe
@@ -117,29 +91,8 @@ services:
     volumes:
       - ./results:/app/results
     environment:
-      - PROBE_HOST=confirmation-dispatcher
-      - PROBE_PORT=8090
-      - PROBE_TRADERS=1000
-      - PROBE_DURATION=2400
-      - PROBE_FASE1_DURATION=600
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
-  injector:
-    build: ./injector
-    container_name: injector
-    ports:
-      - "8089:8089"
-    depends_on:
-      api-gateway:
-        condition: service_started
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4096M
-    environment:
-      - TARGET_URL=http://api-gateway:8000
-      - FASE1_USER_THRESHOLD=40
+      PROBE_HOST: confirmation-dispatcher
+      PROBE_PORT: "8090"
+      PROBE_TRADERS: "1000"
+      PROBE_DURATION: "2400"
+      PROBE_FASE1_DURATION: "600"

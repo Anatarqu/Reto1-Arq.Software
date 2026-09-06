@@ -1,5 +1,5 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir pika
 COPY engine.py .
-CMD ["python", "engine.py"]
+RUN pip install --no-cache-dir pika
+CMD ["python","engine.py"]
