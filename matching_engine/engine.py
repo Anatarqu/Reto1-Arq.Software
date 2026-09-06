@@ -9,6 +9,7 @@ ORDER_QUEUE = os.getenv("ORDER_QUEUE", "orders_buffer")
 CONFIRMATION_EXCHANGE = os.getenv("CONFIRMATION_EXCHANGE", "trade_events")
 CONFIRMATION_QUEUE = os.getenv("CONFIRMATION_QUEUE", "trade_confirmations")
 CONFIRMATION_ROUTING_KEY = os.getenv("CONFIRMATION_ROUTING_KEY", "trade.confirmation")
+ORDER_QUEUE_MAX_LENGTH = int(os.getenv("ORDER_QUEUE_MAX_LENGTH", "500000"))
 PREFETCH_COUNT = int(os.getenv("PREFETCH_COUNT", "200"))
 CONFIRMATION_BUFFER_SIZE = int(os.getenv("CONFIRMATION_BUFFER_SIZE", "100000"))
 
@@ -161,7 +162,7 @@ def _connect_orders():
     conn = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST, **CONNECTION_PARAMS))
     ch = conn.channel()
     ch.queue_declare(queue=ORDER_QUEUE, durable=True,
-                     arguments={"x-max-length": 500000})
+                     arguments={"x-max-length": ORDER_QUEUE_MAX_LENGTH, "x-overflow": "reject-publish"})
     ch.basic_qos(prefetch_count=PREFETCH_COUNT)
     ch.basic_consume(queue=ORDER_QUEUE, on_message_callback=on_message_received)
     return conn, ch

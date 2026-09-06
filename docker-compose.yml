@@ -33,6 +33,7 @@ services:
     environment:
       RABBITMQ_HOST: queue-broker
       ORDER_QUEUE: orders_buffer
+      ORDER_QUEUE_MAX_LENGTH: "500000"
       PREFETCH_COUNT: "200"
       CONFIRMATION_EXCHANGE: trade_events
       CONFIRMATION_QUEUE: trade_confirmations
@@ -80,6 +81,14 @@ services:
         condition: service_started
     environment:
       TARGET_URL: http://api-gateway:8000
+      # Defaults calibrados para Fase 1 (40 usuarios -> ~22 req/s -> ~1.300/min).
+      # Para otra corrida, sobreescribe con:
+      #   docker compose run -e WAIT_MIN=0.25 -e WAIT_MAX=0.35 injector
+      # o edita estos valores aquí mismo. El número de usuarios y el spawn
+      # rate se siguen configurando manualmente en la interfaz web de
+      # Locust (http://localhost:8089), no aquí.
+      WAIT_MIN: "1.6"
+      WAIT_MAX: "2.0"
 
   latency-probe:
     build: ./latency_probe

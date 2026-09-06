@@ -1,9 +1,26 @@
 import os, time, uuid, random
 from locust import HttpUser, task, between
 
-TARGET_RPS = float(os.getenv("TARGET_RPS", "108.333333"))
-WAIT_MIN = float(os.getenv("WAIT_MIN", "0.01"))
-WAIT_MAX = float(os.getenv("WAIT_MAX", "0.05"))
+# ---------------------------------------------------------------------------
+# Configuración 100% MANUAL: número de usuarios y spawn rate se ajustan en
+# la interfaz web de Locust (http://localhost:8089). WAIT_MIN/WAIT_MAX se
+# ajustan aquí (o por variable de entorno) para calibrar la tasa TOTAL de
+# órdenes/segundo que ese número de usuarios va a generar.
+#
+# Fórmula para elegir WAIT_MIN/WAIT_MAX dado un objetivo de tasa total:
+#     espera_promedio_por_usuario = usuarios / tasa_objetivo_req_por_seg
+#     WAIT_MIN = espera_promedio * 0.9   (aprox.)
+#     WAIT_MAX = espera_promedio * 1.1
+#
+# Ejemplos con los objetivos del PDF:
+#   Fase 1 (40 usuarios, ~1.300 órdenes/min = 21.67 req/s):
+#     espera_promedio = 40 / 21.67 ≈ 1.85s -> WAIT_MIN=1.6 WAIT_MAX=2.0 (default)
+#   Fase 2 (250 usuarios, ~6.500 órdenes/min = 108.33 req/s):
+#     espera_promedio = 250 / 108.33 ≈ 2.31s -> WAIT_MIN=2.05 WAIT_MAX=2.55
+#     docker compose run -e WAIT_MIN=2.05 -e WAIT_MAX=2.55 injector
+# ---------------------------------------------------------------------------
+WAIT_MIN = float(os.getenv("WAIT_MIN", "1.6"))
+WAIT_MAX = float(os.getenv("WAIT_MAX", "2.0"))
 
 class FinancialTrader(HttpUser):
     wait_time = between(WAIT_MIN, WAIT_MAX)

@@ -22,7 +22,10 @@ CONNECTION_PARAMS = dict(
 def _declare_order_queue(channel):
     channel.queue_declare(
         queue=ORDER_QUEUE, durable=True,
-        arguments={"x-max-length": ORDER_QUEUE_MAX_LENGTH},
+        arguments={
+            "x-max-length": ORDER_QUEUE_MAX_LENGTH,
+            "x-overflow": "reject-publish",
+        },
     )
 
 def _connect():
