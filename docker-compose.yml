@@ -120,7 +120,8 @@ services:
       - PROBE_HOST=confirmation-dispatcher
       - PROBE_PORT=8090
       - PROBE_TRADERS=1000
-      - PROBE_DURATION=600
+      - PROBE_DURATION=2400
+      - PROBE_FASE1_DURATION=600
     deploy:
       resources:
         limits:
@@ -141,3 +142,4 @@ services:
           memory: 4096M
     environment:
       - TARGET_URL=http://api-gateway:8000
+      - FASE1_USER_THRESHOLD=40
