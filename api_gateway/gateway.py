@@ -1,59 +1,73 @@
+```python
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+
 import pika
 import json
 import time
 import os
 import threading
 
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'localhost')
 
-# Singleton para mantener el canal global persistente
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+
+ORDER_QUEUE = "orders_buffer"
+ORDER_QUEUE_MAX_LENGTH = 500000
+
 rabbitmq_client = {}
-# pika.BlockingConnection/channel NO es thread-safe: run_in_threadpool puede
-# ejecutar varias publicaciones concurrentes en hilos distintos, así que
-# serializamos el acceso al canal con un lock. Esto no reintroduce el
-# bloqueo del event loop (el lock se espera dentro del hilo del threadpool,
-# no en el hilo del event loop), solo evita que dos hilos toquen el mismo
-# canal pika a la vez.
 _publish_lock = threading.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Código de inicialización al arrancar el contenedor
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+
+    parameters = pika.ConnectionParameters(
+        host=RABBITMQ_HOST,
+        heartbeat=60,
+        blocked_connection_timeout=30,
+        connection_attempts=10,
+        retry_delay=2,
+    )
+
+    connection = pika.BlockingConnection(parameters)
     channel = connection.channel()
-    # IMPORTANTE: el nombre y los argumentos deben ser IDÉNTICOS a los que
-    # declara matching_engine/engine.py para la misma cola. Si difieren,
-    # RabbitMQ rechaza la declaración más reciente (406 PRECONDITION_FAILED)
-    # y, si además el nombre difiere, gateway y engine terminan hablándole
-    # a colas completamente distintas sin que nada lo reporte como error.
+
+    # EXACTAMENTE la misma configuración que utiliza matching-engine.
     channel.queue_declare(
-        queue='orders_buffer',
+        queue=ORDER_QUEUE,
         durable=True,
         arguments={
-            'x-max-length': 500000,
-            'x-overflow': 'reject-publish'
-        }
+            "x-max-length": ORDER_QUEUE_MAX_LENGTH,
+            "x-overflow": "reject-publish",
+        },
     )
-    rabbitmq_client['channel'] = channel
-    rabbitmq_client['connection'] = connection
-    print("[+] API Gateway: Conexión persistente a RabbitMQ establecida.")
+
+    # Publisher confirms.
+    channel.confirm_delivery()
+
+    rabbitmq_client["channel"] = channel
+    rabbitmq_client["connection"] = connection
+
+    print(
+        f"[+] API Gateway conectado a RabbitMQ "
+        f"queue={ORDER_QUEUE}"
+    )
 
     yield
 
-    # Limpieza al detener el contenedor
     try:
         connection.close()
     except Exception:
         pass
 
 
-# Inyección del ciclo de vida en FastAPI
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Trading Transaction Gateway",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 class OrderSchema(BaseModel):
@@ -67,32 +81,87 @@ class OrderSchema(BaseModel):
 
 
 def _publish_blocking(payload: dict):
-    """
-    Llamada síncrona real a pika. Se ejecuta en un hilo del threadpool de
-    Starlette (run_in_threadpool), nunca directamente en el event loop,
-    para que una publicación lenta no congele el resto de las requests
-    concurrentes que llegan al gateway.
-    """
-    channel = rabbitmq_client['channel']
+
+    channel = rabbitmq_client["channel"]
+
     with _publish_lock:
-        channel.basic_publish(
-            exchange='',
-            routing_key='orders_buffer',
-            body=json.dumps(payload),
-            properties=pika.BasicProperties(delivery_mode=2)
+
+        published = channel.basic_publish(
+            exchange="",
+            routing_key=ORDER_QUEUE,
+            body=json.dumps(
+                payload,
+                separators=(",", ":"),
+            ),
+            properties=pika.BasicProperties(
+                delivery_mode=2,
+                content_type="application/json",
+            ),
+            mandatory=True,
         )
+
+        if published is False:
+            raise RuntimeError(
+                "RabbitMQ no confirmó la publicación"
+            )
+
+
+@app.get("/health")
+async def health():
+
+    connection = rabbitmq_client.get("connection")
+
+    if connection is None or connection.is_closed:
+        raise HTTPException(
+            status_code=503,
+            detail="RabbitMQ unavailable",
+        )
+
+    return {
+        "status": "UP",
+        "service": "api-gateway",
+        "queue": ORDER_QUEUE,
+    }
 
 
 @app.post("/api/v1/orders")
 async def ingest_order(order: OrderSchema):
+
     ts_ingest_start = time.time_ns()
+
     payload = order.model_dump()
-    payload['ts_ingest_start'] = ts_ingest_start
+
+    payload["ts_ingest_start"] = ts_ingest_start
 
     try:
-        await run_in_threadpool(_publish_blocking, payload)
+
+        await run_in_threadpool(
+            _publish_blocking,
+            payload,
+        )
+
         ts_ingest_end = time.time_ns()
-        latency_ms = (ts_ingest_end - ts_ingest_start) / 1_000_000.0
-        return {"status": "ACK", "ingest_latency_ms": latency_ms}
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Buffer Saturated or Unreachable")
+
+        latency_ms = (
+            ts_ingest_end - ts_ingest_start
+        ) / 1_000_000.0
+
+        return {
+            "status": "ACK",
+            "order_id": order.order_id,
+            "ingest_latency_ms": latency_ms,
+        }
+
+    except Exception as exc:
+
+        print(
+            f"[GATEWAY][ERROR] "
+            f"order={order.order_id} "
+            f"error={exc}"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Buffer saturated or RabbitMQ unavailable",
+        )
+```
