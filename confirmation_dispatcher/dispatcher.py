@@ -5,6 +5,9 @@ Confirmation Dispatcher
 - Deduplica con IdempotencyGuard (L1 cachetools + L2 Redis).
 - Entrega la confirmación a comprador y vendedor por un canal push
   persistente (WebSocket), evitando el retardo estructural del polling.
+- Reconecta automáticamente si la conexión con RabbitMQ se cae: antes, si
+  esto pasaba, el hilo consumidor moría en silencio (era un daemon thread)
+  y /health seguía devolviendo "ok" aunque ya no se procesara nada más.
 """
 import asyncio
 import json
@@ -25,6 +28,23 @@ logger = logging.getLogger("dispatcher")
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 CONFIRMATION_QUEUE = os.getenv("CONFIRMATION_QUEUE", "trade_confirmations")
 
+CONNECTION_PARAMS = dict(
+    heartbeat=60,
+    blocked_connection_timeout=30,
+    connection_attempts=10,
+    retry_delay=2,
+)
+
+RECOVERABLE_ERRORS = (
+    pika.exceptions.AMQPConnectionError,
+    pika.exceptions.ConnectionClosedByBroker,
+    pika.exceptions.ChannelClosedByBroker,
+    pika.exceptions.ChannelWrongStateError,
+    pika.exceptions.StreamLostError,
+    ConnectionError,
+    OSError,
+)
+
 app = FastAPI()
 idempotency_guard = IdempotencyGuard()
 
@@ -34,6 +54,10 @@ connections_lock = asyncio.Lock()
 
 main_event_loop: asyncio.AbstractEventLoop | None = None
 
+# Se actualiza en cada reconexión exitosa; expuesto en /health para que sea
+# visible desde afuera si el consumidor sigue vivo o lleva rato caído.
+consumer_status = {"connected": False, "last_error": None}
+
 
 @app.on_event("startup")
 async def startup():
@@ -41,7 +65,7 @@ async def startup():
     main_event_loop = asyncio.get_running_loop()
     # El consumidor pika es bloqueante -> corre en un hilo dedicado, nunca
     # en el event loop de FastAPI.
-    thread = threading.Thread(target=run_confirmation_consumer, daemon=True)
+    thread = threading.Thread(target=run_consumer_forever, daemon=True)
     thread.start()
 
 
@@ -53,7 +77,6 @@ async def websocket_endpoint(websocket: WebSocket, trader_id: str):
     logger.info("Trader %s conectado (%d conexiones activas)", trader_id, len(connections[trader_id]))
     try:
         while True:
-            # No esperamos mensajes del cliente; solo mantenemos el socket vivo.
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
@@ -68,10 +91,6 @@ async def _send_to_trader(trader_id: str, message: dict):
     async with connections_lock:
         sockets = list(connections.get(trader_id, ()))
     if not sockets:
-        # Trader no conectado en este momento: la confirmación se pierde
-        # a nivel de push (no a nivel de negocio, ya quedó deduplicada y
-        # loggeada). Punto de extensión: guardar un buffer corto por
-        # trader y reenviar al reconectar (outbox), si el negocio lo exige.
         logger.warning("Trader %s sin conexión activa; confirmación %s no entregada por push.",
                         trader_id, message.get("confirmation_id"))
         return
@@ -84,8 +103,6 @@ async def _send_to_trader(trader_id: str, message: dict):
 
 
 def dispatch_confirmation(order_data: dict):
-    """Se ejecuta en el hilo del consumidor pika. Agenda el envío async
-    en el event loop principal de FastAPI de forma thread-safe."""
     ts_dispatch = time.time_ns()
     latency_ms = (ts_dispatch - order_data["ts_match_end"]) / 1_000_000.0
 
@@ -127,22 +144,60 @@ def on_confirmation_received(ch, method, properties, body):
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
-def run_confirmation_consumer():
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+def _connect_and_declare():
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host=RABBITMQ_HOST, **CONNECTION_PARAMS)
+    )
     channel = connection.channel()
     channel.queue_declare(
         queue=CONFIRMATION_QUEUE,
         durable=True,
-        arguments={'x-max-priority': 10},
+        arguments={"x-max-priority": 10},
     )
-    # Prefetch bajo: esta cola es de baja latencia/alto valor por mensaje,
-    # no de throughput masivo como orders_buffer.
     channel.basic_qos(prefetch_count=20)
     channel.basic_consume(queue=CONFIRMATION_QUEUE, on_message_callback=on_confirmation_received)
-    logger.info("[*] Confirmation Dispatcher conectado a '%s' (conexión dedicada).", CONFIRMATION_QUEUE)
-    channel.start_consuming()
+    return connection, channel
+
+
+def run_consumer_forever():
+    """
+    Bucle exterior de reconexión, igual que en matching_engine. Si la
+    conexión muere, se reconecta y retoma el consumo en vez de dejar el
+    hilo daemon morir en silencio.
+    """
+    backoff_seconds = 1
+    while True:
+        try:
+            connection, channel = _connect_and_declare()
+            logger.info("[*] Confirmation Dispatcher conectado a '%s' (conexión dedicada).",
+                        CONFIRMATION_QUEUE)
+            consumer_status["connected"] = True
+            consumer_status["last_error"] = None
+            backoff_seconds = 1
+            channel.start_consuming()
+        except RECOVERABLE_ERRORS as exc:
+            consumer_status["connected"] = False
+            consumer_status["last_error"] = str(exc)
+            logger.warning("[RECONNECT] Conexión de confirmaciones perdida (%s); "
+                            "reintentando en %ss...", exc, backoff_seconds)
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 30)
+        except Exception as exc:
+            # Cualquier otro error inesperado tampoco debe matar el hilo
+            # en silencio: se loggea, se marca el estado y se reintenta.
+            consumer_status["connected"] = False
+            consumer_status["last_error"] = str(exc)
+            logger.exception("[RECONNECT] Error inesperado en el consumidor; reintentando en %ss...",
+                              backoff_seconds)
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 30)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "active_traders_connected": len(connections)}
+    return {
+        "status": "ok" if consumer_status["connected"] else "degraded",
+        "consumer_connected": consumer_status["connected"],
+        "consumer_last_error": consumer_status["last_error"],
+        "active_traders_connected": len(connections),
+    }
