@@ -1,20 +1,27 @@
 """
 Probe de latencia del canal transaccional.
-Se ejecuta en el HOST (no dentro de docker-compose) mientras Locust está
-generando tráfico. Se conecta como los mismos traders que usa el
-locustfile.py (TRADER_1..TRADER_N) y mide, para cada confirmación recibida:
+
+Corre DENTRO de la red de docker-compose, conectándose directamente a
+ws://confirmation-dispatcher:8090/ws/{trader_id} — sin pasar por el NAT de
+publicación de puertos del host, para medir la latencia interna real del
+canal transaccional (más fiel al escenario donde un consumidor interno
+futuro se conecta al dispatcher).
+
+Se conecta como los mismos traders que usa injector/locustfile.py
+(TRADER_1..TRADER_N) y mide, para cada confirmación recibida:
 
     latencia_total_ms = ts_receipt - order['ts_match_end']
 
 que es exactamente la latencia que la hipótesis busca acotar a <= 0.35s p95.
 
-Uso:
-    pip install websockets
-    python ws_latency_probe.py --traders 1000 --host localhost --port 8090 --duration 600
+Configuración por variables de entorno (con defaults para Fase 1) o por
+argumentos CLI, que tienen prioridad sobre las variables de entorno.
 """
 import argparse
 import asyncio
 import csv
+import json
+import os
 import statistics
 import time
 
@@ -33,7 +40,6 @@ async def listen(trader_id: str, uri: str, stop_event: asyncio.Event):
                 except asyncio.TimeoutError:
                     continue
                 ts_receipt_ns = time.time_ns()
-                import json
                 msg = json.loads(raw)
                 latency_ms = (ts_receipt_ns - msg["ts_match_end"]) / 1_000_000.0
                 async with lock:
@@ -50,14 +56,15 @@ async def main(args):
         uri = f"ws://{args.host}:{args.port}/ws/{trader_id}"
         tasks.append(asyncio.create_task(listen(trader_id, uri, stop_event)))
 
-    print(f"Escuchando {args.traders} traders durante {args.duration}s...")
+    print(f"Escuchando {args.traders} traders en {args.host}:{args.port} "
+          f"durante {args.duration}s...")
     await asyncio.sleep(args.duration)
     stop_event.set()
     await asyncio.gather(*tasks, return_exceptions=True)
 
     if not latencies_ms:
         print("No se recibieron confirmaciones. Verifica que el tráfico de Locust "
-              "esté usando los mismos trader_id (TRADER_1..TRADER_N).")
+              "esté corriendo y usando los mismos trader_id (TRADER_1..TRADER_N).")
         return
 
     sorted_lat = sorted(latencies_ms)
@@ -73,19 +80,23 @@ async def main(args):
     print(f"max: {max(sorted_lat):.2f} ms")
     print(f"Hipótesis {'CUMPLIDA' if p95 <= 350 else 'NO CUMPLIDA'} (p95 <= 350ms)")
 
-    with open("confirmation_latencies.csv", "w", newline="") as f:
+    os.makedirs(args.output_dir, exist_ok=True)
+    out_path = os.path.join(args.output_dir, "confirmation_latencies.csv")
+    with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["latency_ms"])
         for v in sorted_lat:
             writer.writerow([v])
-    print("Detalle guardado en confirmation_latencies.csv")
+    print(f"Detalle guardado en {out_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--traders", type=int, default=1000)
-    parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--duration", type=int, default=600, help="segundos (600 = 10 min, Fase 1)")
+    parser.add_argument("--traders", type=int, default=int(os.getenv("PROBE_TRADERS", "1000")))
+    parser.add_argument("--host", type=str, default=os.getenv("PROBE_HOST", "confirmation-dispatcher"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PROBE_PORT", "8090")))
+    parser.add_argument("--duration", type=int, default=int(os.getenv("PROBE_DURATION", "600")),
+                         help="segundos (600 = 10 min, Fase 1)")
+    parser.add_argument("--output-dir", type=str, default=os.getenv("PROBE_OUTPUT_DIR", "/app/results"))
     args = parser.parse_args()
     asyncio.run(main(args))
