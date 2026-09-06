@@ -92,7 +92,34 @@ def _ensure_connection():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _connect()
+
+    stop_heartbeat = threading.Event()
+
+    def _heartbeat_keepalive():
+        """
+        pika.BlockingConnection SOLO procesa heartbeats cuando algo llama a
+        un método suyo. Si el gateway está arriba pero no llegan órdenes
+        (por ejemplo, mientras Locust todavía no arranca, o entre Fase 1 y
+        Fase 2), la conexión queda inactiva y RabbitMQ la cierra por
+        "missed heartbeats" aunque la red esté perfectamente sana. Este
+        hilo despierta cada 15s y le da a pika la oportunidad de servir
+        heartbeats, para no depender únicamente de la reconexión reactiva.
+        """
+        while not stop_heartbeat.wait(15):
+            with _publish_lock:
+                connection = rabbitmq_client.get("connection")
+                try:
+                    if connection is not None and connection.is_open:
+                        connection.process_data_events(time_limit=0)
+                except Exception as exc:
+                    logger.warning(f"[HEARTBEAT] Error sirviendo heartbeat: {exc}")
+
+    heartbeat_thread = threading.Thread(target=_heartbeat_keepalive, daemon=True)
+    heartbeat_thread.start()
+
     yield
+
+    stop_heartbeat.set()
     try:
         connection = rabbitmq_client.get("connection")
         if connection is not None:

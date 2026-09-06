@@ -84,6 +84,27 @@ def _ensure_confirm_channel():
 _connect_confirm_channel()
 
 
+def _confirm_heartbeat_keepalive():
+    """
+    Igual que en el gateway: el canal de confirmaciones publica de forma
+    intermitente (solo cuando hay matches), así que puede quedar inactivo
+    el tiempo suficiente para que RabbitMQ lo cierre por heartbeats
+    perdidos si nadie lo atiende mientras tanto.
+    """
+    while True:
+        time.sleep(15)
+        with _confirm_lock:
+            connection = _confirm_state.get("connection")
+            try:
+                if connection is not None and connection.is_open:
+                    connection.process_data_events(time_limit=0)
+            except Exception as exc:
+                logger.warning(f"[HEARTBEAT] Error sirviendo heartbeat de confirmaciones: {exc}")
+
+
+threading.Thread(target=_confirm_heartbeat_keepalive, daemon=True).start()
+
+
 def publish_confirmation(payload: dict, max_retries: int = 3) -> bool:
     """
     Best-effort: intenta publicar la confirmación, reconectando el canal si
