@@ -1,4 +1,5 @@
 services:
+  # Nodo 2: Queue Broker (Buffer Asíncrono - RabbitMQ)
   queue-broker:
     image: rabbitmq:3-management
     container_name: queue-broker
@@ -8,14 +9,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
-          memory: 2048M  # Optimizado para evitar OOM 137
+          cpus: '2.0'
+          memory: 4096M
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "check_running"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+  # Ingesta: API Gateway (Simulador HTTP Ligero) - CQRS Command Flow
   api-gateway:
     build: ./api_gateway
     container_name: api-gateway
@@ -27,11 +29,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
-          memory: 1024M  # Optimizado
+          cpus: '2.0'
+          memory: 2048M
     environment:
       - RABBITMQ_HOST=queue-broker
 
+  # Nodo 3: Matching Engine (Actor Model & In-Memory Processing)
   matching-engine:
     build: ./matching_engine
     container_name: matching-engine
@@ -41,12 +44,64 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.5'
-          memory: 3078M  # Optimizado
+          cpus: '4.0'
+          memory: 8192M
     environment:
       - RABBITMQ_HOST=queue-broker
       - PREFETCH_COUNT=100
+      - CONFIRMATION_QUEUE=trade_confirmations
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
 
+  # Nodo 4b (NUEVO): Redis - Store L2 de idempotencia (atómico, compartible
+  # entre réplicas del dispatcher). Sin persistencia a disco: es una cache,
+  # no un sistema de registro, así que no debe sumar I/O a la ruta crítica.
+  redis-idempotency:
+    image: redis:7-alpine
+    container_name: redis-idempotency
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 768M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Nodo 4 (NUEVO): Confirmation Dispatcher (Canal transaccional prioritario +
+  # Motor de Idempotencia L1 cachetools / L2 Redis + Push WebSocket)
+  confirmation-dispatcher:
+    build: ./confirmation_dispatcher
+    container_name: confirmation-dispatcher
+    ports:
+      - "8090:8090"
+    depends_on:
+      queue-broker:
+        condition: service_healthy
+      redis-idempotency:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+    environment:
+      - RABBITMQ_HOST=queue-broker
+      - CONFIRMATION_QUEUE=trade_confirmations
+      - REDIS_HOST=redis-idempotency
+      - REDIS_PORT=6379
+      - IDEMPOTENCY_TTL_SECONDS=300
+      - L1_CACHE_SIZE=50000
+      - L1_CACHE_TTL_SECONDS=120
+
+  # Nodo 1: Inyector de Carga Extrínseco (Locust con perfiles de Stress Test)
   injector:
     build: ./injector
     container_name: injector
@@ -58,7 +113,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.5'
-          memory: 1024M  # Optimizado
+          cpus: '2.0'
+          memory: 4096M
     environment:
       - TARGET_URL=http://api-gateway:8000
