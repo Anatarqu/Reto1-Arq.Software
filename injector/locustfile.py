@@ -1,4 +1,3 @@
-```python
 from locust import HttpUser, task, between
 
 import uuid
@@ -111,4 +110,3 @@ class FinancialTrader(HttpUser):
                     response.failure(
                         "Respuesta JSON inválida"
                     )
-```

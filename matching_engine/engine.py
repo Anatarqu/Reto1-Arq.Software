@@ -1,4 +1,3 @@
-```python
 import pika
 import json
 import heapq
@@ -448,4 +447,3 @@ print(
 
 
 channel.start_consuming()
-```

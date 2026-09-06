@@ -1,4 +1,3 @@
-```python
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
@@ -164,4 +163,3 @@ async def ingest_order(order: OrderSchema):
             status_code=503,
             detail="Buffer saturated or RabbitMQ unavailable",
         )
-```
