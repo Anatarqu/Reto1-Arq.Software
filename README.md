@@ -25,25 +25,28 @@ La prueba de ingreso puede superar 5000 órdenes/min; eso **no equivale automát
 ## Ejecución
 
 ```bash
+TERMINAL 1: levantamiento de contenedor
+docker compose down --rmi all -v --remove-orphans 
 docker compose down -v
 docker compose build --no-cache
 docker compose up -d
+docker compose logs confirmation-dispatcher | grep -i websocket
 
-# Ver servicios
-docker compose ps
-docker compose logs -f matching-engine confirmation-dispatcher
-```
+http://localhost:15672 RabbitMQ
+http://localhost:8089 LOCUST
 
-Para la fase de carga, usa Locust contra:
-
-```text
-http://localhost:8000
-```
-
-Para medir el canal WebSocket:
-
-```bash
+TERMINAL 2: levantamiento latency con 1.000 conexiones WebSocket
 docker compose --profile test run --rm latency-probe
-```
 
-El probe debe ejecutarse durante la ventana de 30 minutos del pico.
+TERMINAL 3: ver emparejamientos
+docker compose logs matching-engine | Select-String "1MIN"
+
+TERMINAL 4: ver funcionamiento websockets
+docker compose logs confirmation-dispatcher | Select-String "DISPATCH"
+
+
+Ejemplo: prueba de 15 minutos totales (5 min Fase 1 + 10 min Fase 2)docker compose --profile test run --rm -e PROBE_DURATION=900 -e PROBE_FASE1_DURATION=300 latency-probe
+PROBE_DURATION: segundos TOTALES que el probe escucha (hoy 2400 = 40 min)
+PROBE_FASE1_DURATION: en qué segundo corta el reporte entre Fase 1 y Fase 2 (hoy 600 = 10 min)
+
+```
