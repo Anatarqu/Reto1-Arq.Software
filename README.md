@@ -28,22 +28,14 @@ La prueba de ingreso puede superar 5000 órdenes/min; eso **no equivale automát
 docker compose down -v
 docker compose build --no-cache
 docker compose up -d
-
-# Ver servicios
-docker compose ps
-docker compose logs -f matching-engine confirmation-dispatcher
-```
-
-Para la fase de carga, usa Locust contra:
-
-```text
-http://localhost:8000
 ```
 
 Para medir el canal WebSocket:
 
 ```bash
 docker compose --profile test run --rm latency-probe
+o cambiando los valores
+docker compose --profile test run --rm -e PROBE_DURATION=XXX -e PROBE_FASE1_DURATION=XXX latency-probe
+PROBE_DURATION: segundos TOTALES que el probe escucha
+PROBE_FASE1_DURATION: en qué segundo corta el reporte entre Fase 1 y Fase 2
 ```
-
-El probe debe ejecutarse durante la ventana de 30 minutos del pico.
