@@ -30,7 +30,7 @@ docker compose down --rmi all -v --remove-orphans
 docker compose down -v
 docker compose build --no-cache
 docker compose up -d
-docker compose logs confirmation-dispatcher | grep -i websocket
+docker compose logs confirmation-dispatcher
 
 http://localhost:15672 RabbitMQ
 http://localhost:8089 LOCUST
